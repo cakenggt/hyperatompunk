@@ -10,165 +10,19 @@
  *
  * So we must apply any shader effects to all of these layers.
  *
- * One big downside: it's possible that mouse events do not visually sync with
- * outputted text. I haven't looked into the magic XTerm uses to add a selection
- * background when clicking with the mouse, but whatever it is, it will be either
- * impossible or really really difficult to make it work with arbitrary fragment
- * shaders.
+ * Downside: any terminal contents that are re-positioned by shaders will be out
+ * of sync with xTerm's text selection.
  */
 
 import {
 	Scene, OrthographicCamera, WebGLRenderer, PlaneGeometry, Mesh, Vector2,
 	MeshBasicMaterial, CanvasTexture, LinearFilter, Clock
 } from 'three';
-import { EffectComposer, RenderPass } from 'postprocessing';
-import {
-	createPassFromFragmentString,
-	createPassFromOptions,
-	createPassFromCallback
-} from './shader-loader';
-
-const SHADER = ({ ShaderPass, ShaderMaterial }) => {
-  const crtFragmentShader = `
-  uniform sampler2D tDiffuse;
-  uniform vec2 resolution;
-  uniform float timeElapsed;
-  uniform float separation;
-  uniform sampler2D lastRender;
-  varying vec2 vUv;
-
-  float random(in float diff)
-  {
-    return fract(sin(diff)*100000.0);
-  }
-
-  vec4 screenDoor(vec4 fragColor)
-  {
-    float width = 3.0;
-    float height = 3.0;
-    float brightness = 0.5;
-    vec2 bvector = vec2(brightness);
-
-    float x = mod((vUv.x * resolution.x), width) / 3.0;
-    float y = mod((vUv.y * resolution.y), (height+1.0));
-    // r g and b channels in each pixel
-    if (x < 0.33) {
-        fragColor.gb *= bvector;
-    }
-    else if (x < 0.66) {
-        fragColor.rb *= bvector;
-    }
-    else {
-        fragColor.rg *= bvector;
-    }
-
-    if (y <= 1.0) {
-        fragColor.rgb *= vec3(0);
-    }
-
-    return fragColor;
-  }
-
-  vec4 separate(vec4 fragColor)
-  {
-    // Separate colors
-    int separationPixels = 2;
-    float separationPercentage = float(separationPixels) / resolution.x;
-    float separationValue = separation*separationPercentage;
-    vec4 blueColor = texture2D(tDiffuse, vUv - vec2(separationValue, 0)) * vec4(0, 0.5, 1, 1);
-    vec4 redColor = texture2D(tDiffuse, vUv + vec2(separationValue, 0)) * vec4(1, 0.5, 0, 1);
-    fragColor = blueColor + redColor;
-
-    return fragColor;
-  }
-
-  vec4 flicker(in vec4 fragColor)
-  {
-    //flicker
-    float magnitude = 0.1;
-    fragColor.rgb *= vec3(1.0 - (random(timeElapsed) * magnitude));
-
-    return fragColor;
-  }
-
-  void main()
-  {
-    gl_FragColor = texture2D(tDiffuse, vUv);
-
-    gl_FragColor = separate(gl_FragColor);
-
-    gl_FragColor = flicker(gl_FragColor);
-
-    gl_FragColor = screenDoor(gl_FragColor);
-  }
-  `;
-
-  class CustomShaderPass extends ShaderPass {
-    render(renderer, readBuffer, writeBuffer, timeDelta) {
-      // set any custom uniforms here -- important to go before the `super` call
-      this.material.uniforms.separation.value = Math.min(
-        1.0,
-        Math.max(
-          0.0,
-          this.material.uniforms.separation.value + (Math.random() - 0.5)/5
-        )
-      );
-
-      if (this.lastRender) {
-        this.material.uniforms.lastRender.value = this.lastRender;
-      }
-
-
-      super.render(...arguments);
-
-      this.lastRender = writeBuffer.texture.clone();
-    }
-  }
-
-  const crtShaderMaterial = new ShaderMaterial({
-    fragmentShader: crtFragmentShader,
-    uniforms: {
-      separation: { value: 0.5 },
-      lastRender: { value: null }
-    }
-  });
-
-  const curvedFragmentShader = `
-  uniform sampler2D tDiffuse;
-  varying vec2 vUv;
-  float easeInQuart(float time, float begin, float change, float duration) {
-    return change * (time /= duration) * time * time * time + begin;
-  }
-  vec2 curvedMonitor(vec2 inputUV) {
-    vec2 screenCenter = vec2(0.5);
-    float radius = 0.5;
-    float magnitude = 0.05; // how far the center of the "monitor" points out
-    float cutShort = 0.3; // how far along the the easing curve we travel...I think...
-    vec2 coords = vec2(inputUV.x - screenCenter.x, inputUV.y - screenCenter.y);
-    float distFromOrigin = distance(inputUV, screenCenter);
-    float scalar = easeInQuart(distFromOrigin, 1.0 / cutShort - magnitude, magnitude, radius);
-    coords *= scalar * cutShort;
-    return vec2(coords.x + screenCenter.x, coords.y + screenCenter.y);
-  }
-  void main() {
-    vec2 pos = curvedMonitor(vUv);
-    // avoids awkward texture sampling when pixel is not constrained to (0, 1)
-    if (pos.x < 0.0 || pos.y < 0.0 || pos.x > 1.0 || pos.y > 1.0) {
-      discard;
-    }
-    gl_FragColor = texture2D(tDiffuse, pos);
-  }
-  `;
-
-  return [
-    { shaderPass: new CustomShaderPass(crtShaderMaterial) },
-    { shaderMaterial: new ShaderMaterial({ fragmentShader: curvedFragmentShader }) },
-  ];
-};
-
+import { EffectComposer, RenderPass, Pass, EffectPass } from 'postprocessing';
+import createPasses from './passes';
 
 exports.decorateTerm = (Term, { React }) => {
-	class PostProcessing extends React.Component {
+	class HyperPostProcessing extends React.Component {
 		constructor(...args) {
 			super(...args);
 
@@ -178,68 +32,69 @@ exports.decorateTerm = (Term, { React }) => {
 			this._isInit = false; // have we already initialized?
 			this._term = null; // IV for the argument passed in `onDecorated`
 			this._xTermScreen = null; // xterm's container for render layers
+			this._xTermLayerMap = new Map(); // map for each render layer and the material we will create
 			this._container = null; // container for the canvas we will inject
 			this._canvas = null; // the canvas we will inject
-			this._layers = {}; // holds XTerms rendered canvas, as well as the threejs Textures
-			this.passes = []; // all of the shader passes for effectcomposer
 			this._clock = this._scene = this._renderer = this._camera = this._composer = null; // threejs + postprocessing stuff
+
+			this.passes = []; // all of the passes for EffectComposer
+			this._shaderPasses = []; // a subset of all passes that are not an EffectPass
 		}
 
 		_onDecorated(term) {
-			// according to Hyper docs, this is needed to continue the "chain flow"
 			if (this.props.onDecorated) {
 				this.props.onDecorated(term);
 			}
 
-			if (!term) {
+			if (!term || this._isInit) {
 				return;
 			}
 
-			if (!this._isInit) {
-				this._term = term;
-				this._init();
-			}
+			this._term = term;
+			this._init();
 		}
 
 		_init() {
-			let shaders;
-			try {
-				shaders = this._parseShadersFromConfig(SHADER);
-			} catch (e) {
-				console.warn(e);
-			}
-
-			if (!shaders) {
+			console.log('start init')
+			const passes = createPasses();
+			console.log('made passes')
+			if (!passes || passes.length === 0) {
 				return;
 			}
+			console.log('checked length of passes')
 
 			this._isInit = true;
 
 			this._container = this._term.termRef;
 			this._xTermScreen = this._container.querySelector('.xterm .xterm-screen');
 
-			// initialize this._layers["someClassList"] to an object holding an element.
-			// later we will also set the "material" key on this object
-			this._xTermScreen.querySelectorAll('canvas').forEach(el => {
-				this._layers[el.classList.toString()] = { el };
-			});
+			const renderLayers = this._xTermScreen.querySelectorAll('canvas');
+			for (const canvas of renderLayers) {
+				canvas.style.opacity = 0;
+			}
 
+			this._setupScene(renderLayers);
+			this._clock = new Clock({ autoStart: false});
+
+			// store all our passes
+			try {
+				this.passes = [new RenderPass(this._scene, this._camera), ...passes];
+				this.passes[this.passes.length - 1].renderToScreen = true;
+				this.passes.forEach(pass => this._composer.addPass(pass));
+				this._shaderPasses = this.passes.slice(1).filter(pass => {
+					return (pass instanceof Pass) && !(pass instanceof EffectPass);
+				});
+			} catch (e) {
+				console.error(e);
+			}
+
+			console.log(3)
 			// listen for any changes that happen inside XTerm's screen
 			this._layerObserver = new MutationObserver(this._onCanvasReplacement);
 			this._layerObserver.observe(this._xTermScreen, { childList: true });
-
-			Object.values(this._layers).forEach(({ el }) => el.style.opacity = 0);
-			this._clock = new Clock({ autoStart: false});
-			this._setupScene();
-
-			this.passes = [
-				new RenderPass(this._scene, this._camera),
-				...(Array.isArray(shaders) ? shaders : [shaders])
-			];
-			this.passes[this.passes.length - 1].renderToScreen = true;
-			this.passes.forEach(pass => this._composer.addPass(pass));
-
-			// i dont think there's a need to remove this listener later -- hyper takes care of it
+			console.log(2)
+			// set our canvas size and begin rendering
+			// i don't think there's a need to remove this listener
 			this._term.term.on('resize', () => {
 				const {
 					canvasWidth, canvasHeight, scaledCanvasWidth, scaledCanvasHeight
@@ -252,46 +107,23 @@ exports.decorateTerm = (Term, { React }) => {
 					resolution: new Vector2(scaledCanvasWidth, scaledCanvasHeight)
 				});
 			});
-
+			console.log(1)
 			const that = this;
 			this._term.term.on('resize', function resizeOnce() {
 				that._term.term.off('resize', resizeOnce);
+				that._clock.start();
 				that._startAnimationLoop();
 			});
-		}
-
-		_parseShadersFromConfig(config) {
-			// if config is a function, call it passing in the ShaderPass and
-			// ShaderMaterial classes. we still need to parse the return value
-			if (typeof config === 'function') {
-				config = createPassFromCallback(
-					config,
-					{ hyperTerm: this._term, xTerm: this._term.term }
-				);
-			}
-
-			if (!config) {
-				return null;
-			}
-
-			if (typeof config === 'string') {
-				return createPassFromFragmentString(config);
-			} else if (Array.isArray(config)) {
-				const shaders = config
-					.map(item => this._parseShadersFromConfig(item))
-					.filter(item => !!item);
-				return (shaders.length === 0) ? null : shaders;
-			} else if (typeof config === 'object') {
-				return createPassFromOptions(config);
-			}
-
-			return null;
+			console.log('end of _init')
 		}
 
 		/**
 		 * Boilerplate for threejs.
+		 *
+		 * @param {Iterable} renderLayers - The list of xTerm's render layers we
+		 * will use to create textures out of.
 		 */
-		_setupScene() {
+		_setupScene(renderLayers) {
 			const { canvasWidth, canvasHeight } = this._term.term.renderer.dimensions;
 
 			this._canvas = document.createElement('canvas');
@@ -312,13 +144,13 @@ exports.decorateTerm = (Term, { React }) => {
 			// camera!
 			const [w, h] = [canvasWidth / 2, canvasHeight / 2];
 			this._camera = new OrthographicCamera(-w, w, h, -h, 1, 1000);
+			this._camera.position.z = 1;
 
 			// composer!
 			this._composer = new EffectComposer(this._renderer);
 
-			// create a texture and mesh for each of XTerm's canvases
-			Object.values(this._layers).forEach((layerObj, idx) => {
-				const canvas = layerObj.el;
+			// xTerm textures!
+			for (const canvas of renderLayers) {
 				const texture = new CanvasTexture(canvas);
 				texture.minFilter = LinearFilter;
 
@@ -329,13 +161,10 @@ exports.decorateTerm = (Term, { React }) => {
 					transparent: true
 				});
 				const mesh = new Mesh(geometry, material);
-				mesh.position.z = idx;
-
-				layerObj.material = material;
 
 				this._scene.add(mesh);
-				this._camera.position.z += 1;
-			});
+				this._xTermLayerMap.set(canvas, material);
+			}
 
 			// add the element to the page
 			this._container.append(this._renderer.domElement);
@@ -356,31 +185,55 @@ exports.decorateTerm = (Term, { React }) => {
 			}
 		}
 
+		/**
+		 * Sets the given uniforms on all instances of ShaderPasses. We don't need
+		 * to set uniforms on any EffectPasses -- all of the uniforms used here are
+		 * automatically updated by postprocessing.
+		 *
+		 * @param {Object} obj - A map with uniform strings as keys and their value
+		 * as values.
+		 */
 		_setUniforms(obj) {
-			const defaultPasses = this.passes.filter(pass => pass.name === 'DefaultShaderPass');
+			for (const uniformKey of Object.keys(obj)) {
+				const value = obj[uniformKey];
 
-			Object.keys(obj).forEach(uniform => {
-				const value = obj[uniform];
-				defaultPasses.forEach(pass => pass.setUniform(uniform, value));
-			});
+				for (const pass of this._shaderPasses) {
+					const material = pass.getFullscreenMaterial();
+
+					if (material.uniforms[uniformKey] !== undefined) {
+						material.uniforms[uniformKey].value = value;
+					}
+				}
+			}
 		}
 
+		/**
+		 * Begins the rendering loop, as well as sets time uniforms on passes that
+		 * contain them, and sets the `needsUpdate` flag on all of our xTerm
+		 * materials.
+		 */
 		_startAnimationLoop() {
-			const materials = Object.values(this._layers).map(({ material }) => material);
-			const defaultPasses = this.passes.filter(pass => pass.name === 'DefaultShaderPass');
-			this._clock.start();
+			const xTermMaterials = Array.from(this._xTermLayerMap.values());
+			const timeUniforms = this._shaderPasses.filter(pass => {
+				return pass.getFullscreenMaterial().uniforms.time !== undefined;
+			}).map(pass => {
+				return pass.getFullscreenMaterial().uniforms.time;
+			});
+
+			const xTermMaterialsLength = xTermMaterials.length;
+			const timeUniformsLength = timeUniforms.length;
 
 			const that = this;
 
 			(function render() {
 				that._animationId = window.requestAnimationFrame(render);
 
-				for (let i = 0, length = defaultPasses.length; i < length; i++) {
-					defaultPasses[i].setUniform('timeElapsed', that._clock.getElapsedTime());
+				for (let i = 0; i < timeUniformsLength; i++) {
+					timeUniforms.value = that._clock.getElapsedTime();
 				}
 
-				for (let i = 0, length = materials.length; i < length; i++) {
-					materials[i].map.needsUpdate = true;
+				for (let i = 0; i < xTermMaterialsLength; i++) {
+					xTermMaterials[i].map.needsUpdate = true;
 				}
 
 				that._composer.render(that._clock.getDelta());
@@ -389,7 +242,6 @@ exports.decorateTerm = (Term, { React }) => {
 
 		_cancelAnimationLoop() {
 			window.cancelAnimationFrame(this._animationId);
-			this._clock.stop();
 		}
 
 		render() {
@@ -413,12 +265,12 @@ exports.decorateTerm = (Term, { React }) => {
 		}
 
 		_replaceTexture(removedCanvas, addedCanvas) {
-			const affectedLayer = this._layers[removedCanvas.classList.toString()];
+			const affectedMaterial = this._xTermLayerMap.get(removedCanvas);
 			const newTexture = new CanvasTexture(addedCanvas);
 			newTexture.minFilter = LinearFilter;
 
-			affectedLayer.material.map.dispose();
-			affectedLayer.material.map = newTexture;
+			affectedMaterial.map.dispose();
+			affectedMaterial.map = newTexture;
 		}
 
 		componentWillUnmount() {
@@ -427,8 +279,13 @@ exports.decorateTerm = (Term, { React }) => {
 			}
 		}
 
+		/**
+		 * Garbage collection. Also, try many various things to dispose the scene.
+		 * I don't know what the proper way is to do this.
+		 */
 		destroy() {
 			this._cancelAnimationLoop();
+			this._clock.stop();
 
 			while (this._scene.children.length > 0) {
 				const mesh = this._scene.children[0];
@@ -450,12 +307,13 @@ exports.decorateTerm = (Term, { React }) => {
 
 			this._isInit = false;
 			this._term = this._container = this._xTermScreen = this._canvas = null;
-			this._layerObserver = this._layers = this.passes = null;
+			this._layerObserver = this._xTermLayerMap = null;
+			this.passes = this._shaderPasses = null;
 			this._clock = this._scene = this._renderer = this._camera = this._composer = null;
 		}
 	}
 
-	return PostProcessing;
+	return HyperPostProcessing;
 };
 
 // CSS to position the our canvas correctly
