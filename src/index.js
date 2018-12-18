@@ -97,14 +97,14 @@ exports.decorateTerm = (Term, { React }) => {
 			// i don't think there's a need to remove this listener
 			this._term.term.on('resize', () => {
 				const {
-					canvasWidth, canvasHeight, scaledCanvasWidth, scaledCanvasHeight
-				} = this._term.term.renderer.dimensions;
+					width, height
+				} = this._term.term.element.getBoundingClientRect();
 
-				this._composer.setSize(canvasWidth, canvasHeight);
+				this._composer.setSize(width, height);
 
 				this._setUniforms({
-					aspect: canvasWidth / canvasHeight,
-					resolution: new Vector2(scaledCanvasWidth, scaledCanvasHeight)
+					aspect: width / height,
+					resolution: new Vector2(width, height)
 				});
 			});
 			console.log(1)
@@ -124,7 +124,7 @@ exports.decorateTerm = (Term, { React }) => {
 		 * will use to create textures out of.
 		 */
 		_setupScene(renderLayers) {
-			const { canvasWidth, canvasHeight } = this._term.term.renderer.dimensions;
+			const { width, height } = this._term.term.element.getBoundingClientRect();
 
 			this._canvas = document.createElement('canvas');
 			this._canvas.classList.add('hyper-postprocessing', 'canvas');
@@ -139,10 +139,10 @@ exports.decorateTerm = (Term, { React }) => {
 				alpha: true
 			});
 			this._renderer.setPixelRatio(window.devicePixelRatio);
-			this._renderer.setSize(canvasWidth, canvasHeight);
+			this._renderer.setSize(width, height);
 
 			// camera!
-			const [w, h] = [canvasWidth / 2, canvasHeight / 2];
+			const [w, h] = [width / 2, height / 2];
 			this._camera = new OrthographicCamera(-w, w, h, -h, 1, 1000);
 			this._camera.position.z = 1;
 
@@ -154,7 +154,7 @@ exports.decorateTerm = (Term, { React }) => {
 				const texture = new CanvasTexture(canvas);
 				texture.minFilter = LinearFilter;
 
-				const geometry = new PlaneGeometry(canvasWidth, canvasHeight);
+				const geometry = new PlaneGeometry(width, height);
 				const material = new MeshBasicMaterial({
 					color: 0xFFFFFF,
 					map: texture,
